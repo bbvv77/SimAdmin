@@ -3,7 +3,7 @@
 //! 通过 D-Bus 信号监听 ModemManager 的短信接收事件，并增加轮询兜底，
 //! 以便在部分 eSIM/国际运营商场景下尽量减少漏收。
 use crate::db::{Database, SmsMessage};
-use crate::modem_manager::find_modem_path;
+use crate::modem_manager::{cache_smsc_for_identity, current_sim_identity, find_modem_path};
 use crate::notification::NotificationSender;
 use futures_util::StreamExt;
 use std::sync::Arc;
@@ -26,6 +26,7 @@ struct IncomingSms {
     path: String,
     number: String,
     content: String,
+    smsc: String,
 }
 
 fn decode_sms_data(value: &OwnedValue) -> Option<String> {
@@ -59,6 +60,14 @@ async fn read_sms_content(conn: &Connection, sms_path: &str) -> Option<IncomingS
         .and_then(|v| String::try_from(v.clone()).ok())
         .unwrap_or_default();
     let data = props.get("Data").and_then(decode_sms_data);
+    let smsc = ["SMSC", "Smsc", "SmsCenter"]
+        .iter()
+        .find_map(|key| {
+            props
+                .get(*key)
+                .and_then(|v| String::try_from(v.clone()).ok())
+        })
+        .unwrap_or_default();
 
     let state = props
         .get("State")
@@ -79,6 +88,7 @@ async fn read_sms_content(conn: &Connection, sms_path: &str) -> Option<IncomingS
         path: sms_path.to_string(),
         number,
         content,
+        smsc,
     })
 }
 
@@ -109,6 +119,12 @@ async fn process_sms_path(
         len = incoming.content.len(),
         "SMS content read"
     );
+
+    if !incoming.smsc.is_empty() {
+        if let Some(identity) = current_sim_identity(conn).await {
+            cache_smsc_for_identity(db, &identity, &incoming.smsc, "sms_object");
+        }
+    }
 
     match db.insert_sms(
         "incoming",

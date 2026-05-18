@@ -3,7 +3,7 @@
 //! 使用 SQLite 存储短信历史记录和通话记录
 
 use chrono::Utc;
-use rusqlite::{params, Connection, Result};
+use rusqlite::{params, Connection, OptionalExtension, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -48,6 +48,13 @@ pub struct CallStats {
     pub outgoing: i64,
     pub missed: i64,
     pub total_duration: i64, // 总通话时长（秒）
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmscCacheEntry {
+    pub sms_center: String,
+    pub source: String,
+    pub updated_at: String,
 }
 
 /// 数据库管理器
@@ -109,6 +116,19 @@ impl Database {
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_call_phone ON call_history(phone_number)",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS smsc_cache (
+                identity_key TEXT PRIMARY KEY,
+                iccid TEXT,
+                imsi TEXT,
+                operator_id TEXT,
+                sms_center TEXT NOT NULL,
+                source TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
             [],
         )?;
 
@@ -316,6 +336,69 @@ impl Database {
 
         tx.commit()?;
         Ok(deleted)
+    }
+
+    // ==================== SMSC cache ====================
+
+    pub fn upsert_smsc_cache(
+        &self,
+        identity_key: &str,
+        iccid: &str,
+        imsi: &str,
+        operator_id: &str,
+        sms_center: &str,
+        source: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let updated_at = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO smsc_cache (
+                identity_key, iccid, imsi, operator_id, sms_center, source, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(identity_key) DO UPDATE SET
+                iccid = excluded.iccid,
+                imsi = excluded.imsi,
+                operator_id = excluded.operator_id,
+                sms_center = excluded.sms_center,
+                source = excluded.source,
+                updated_at = excluded.updated_at",
+            params![
+                identity_key,
+                iccid,
+                imsi,
+                operator_id,
+                sms_center,
+                source,
+                updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_smsc_cache(&self, identity_keys: &[String]) -> Result<Option<SmscCacheEntry>> {
+        let conn = self.conn.lock().unwrap();
+        for key in identity_keys {
+            let entry = conn
+                .query_row(
+                    "SELECT sms_center, source, updated_at
+                     FROM smsc_cache
+                     WHERE identity_key = ?1",
+                    params![key],
+                    |row| {
+                        Ok(SmscCacheEntry {
+                            sms_center: row.get(0)?,
+                            source: row.get(1)?,
+                            updated_at: row.get(2)?,
+                        })
+                    },
+                )
+                .optional()?;
+            if entry.is_some() {
+                return Ok(entry);
+            }
+        }
+        Ok(None)
     }
 
     // ==================== 通话记录相关方法 ====================

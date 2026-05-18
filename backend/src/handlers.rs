@@ -23,11 +23,11 @@ use crate::{
         get_baseband_restart_progress, get_call_by_path, get_call_settings, get_cell_location,
         get_cells_data, get_data_connection_status, get_device_info_data, get_is_roaming_mm,
         get_network_info_data, get_operators_list, get_radio_mode, get_signal_strength,
-        get_sim_info_data, hangup_all_calls, hangup_call, list_apn_contexts, list_current_calls,
-        make_call, register_operator_auto, register_operator_manual, restart_baseband,
-        scan_operators, send_sms, set_airplane_mode, set_apn_on_bearer, set_band_lock,
-        set_call_waiting, set_data_connection, set_radio_mode, start_cell_monitoring,
-        stop_cell_monitoring,
+        get_sim_info_data_with_cache, hangup_all_calls, hangup_call, list_apn_contexts,
+        list_current_calls, make_call, register_operator_auto, register_operator_manual,
+        restart_baseband, scan_operators, send_sms, set_airplane_mode, set_apn_on_bearer,
+        set_band_lock, set_call_waiting, set_data_connection, set_radio_mode,
+        start_cell_monitoring, stop_cell_monitoring,
     },
     state::AppState,
     utils::{
@@ -79,8 +79,10 @@ pub async fn get_device_info(State(conn): State<Arc<Connection>>) -> impl IntoRe
 // ============ SIM 卡 ============
 
 /// GET /api/sim
-pub async fn get_sim_info(State(conn): State<Arc<Connection>>) -> impl IntoResponse {
-    match get_sim_info_data(&conn).await {
+pub async fn get_sim_info(
+    State((conn, db)): State<(Arc<Connection>, Arc<Database>)>,
+) -> impl IntoResponse {
+    match get_sim_info_data_with_cache(&conn, Some(&db)).await {
         Ok(data) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message("Success", data)),

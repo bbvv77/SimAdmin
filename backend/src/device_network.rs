@@ -792,7 +792,8 @@ async fn update_dnspod_token(
             .unwrap_or_default();
         let current = records.iter().find(|record| {
             record.get("type").and_then(JsonValue::as_str) == Some(record_type)
-                && record.get("name").and_then(JsonValue::as_str) == Some(parsed.sub_domain.as_str())
+                && record.get("name").and_then(JsonValue::as_str)
+                    == Some(parsed.sub_domain.as_str())
         });
         let current_ip = current
             .and_then(|record| record.get("value"))
@@ -844,7 +845,11 @@ async fn dnspod_token_request(
 ) -> Result<JsonValue, String> {
     params.insert(
         "login_token".to_string(),
-        format!("{},{}", config.access_id.trim(), config.access_secret.trim()),
+        format!(
+            "{},{}",
+            config.access_id.trim(),
+            config.access_secret.trim()
+        ),
     );
     params.insert("format".to_string(), "json".to_string());
     let value = client
@@ -857,7 +862,10 @@ async fn dnspod_token_request(
         .await
         .map_err(|err| format!("DNSPod {action} response parse failed: {err}"))?;
     let status = value.get("status").cloned().unwrap_or_else(|| json!({}));
-    let code = status.get("code").and_then(JsonValue::as_str).unwrap_or_default();
+    let code = status
+        .get("code")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
     if code != "1" {
         let message = status
             .get("message")

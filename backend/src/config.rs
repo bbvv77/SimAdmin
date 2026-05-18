@@ -223,6 +223,7 @@ pub struct NotificationConfig {
 pub enum NotificationChannel {
     Webhook,
     Bark,
+    #[serde(rename = "pushplus", alias = "push_plus")]
     PushPlus,
     WecomApp,
     WecomRobot,
@@ -574,6 +575,27 @@ impl Default for DdnsIpConfig {
             urls: Vec::new(),
             domains: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notification_channel_accepts_frontend_pushplus_key() {
+        assert!(matches!(
+            serde_json::from_str::<NotificationChannel>(r#""pushplus""#).unwrap(),
+            NotificationChannel::PushPlus
+        ));
+        assert!(matches!(
+            serde_json::from_str::<NotificationChannel>(r#""push_plus""#).unwrap(),
+            NotificationChannel::PushPlus
+        ));
+        assert_eq!(
+            serde_json::to_string(&NotificationChannel::PushPlus).unwrap(),
+            r#""pushplus""#
+        );
     }
 }
 

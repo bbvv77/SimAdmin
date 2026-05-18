@@ -9,11 +9,11 @@ use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tracing::{info, warn};
 use zbus::{
-    Connection, Proxy,
     zvariant::{OwnedObjectPath, OwnedValue, Value},
+    Connection, Proxy,
 };
 
-use crate::config::ConfigManager;
+use crate::{config::ConfigManager, db::Database};
 use crate::{
     models::{
         AirplaneModeResponse, ApnContext, ApnListResponse, BandLockRequest, BandLockStatus,
@@ -61,6 +61,10 @@ const MM_MODEM_STATE_REGISTERED: i32 = 8;
 const MM_MODEM_STATE_DISCONNECTING: i32 = 9;
 const MM_MODEM_STATE_CONNECTING: i32 = 10;
 const MM_MODEM_STATE_CONNECTED: i32 = 11;
+const MM_MODEM_PORT_TYPE_AT: u32 = 3;
+const MM_MODEM_PORT_TYPE_QMI: u32 = 6;
+const MM_MODEM_PORT_TYPE_MBIM: u32 = 7;
+const SMSC_COMMAND_TIMEOUT_SECS: u64 = 3;
 
 type InterfaceProperties = HashMap<String, OwnedValue>;
 type ManagedObjects = HashMap<OwnedObjectPath, HashMap<String, InterfaceProperties>>;
@@ -135,7 +139,11 @@ fn extract_string_list(value: &OwnedValue) -> Vec<String> {
         return v;
     }
     let s = extract_string(value);
-    if s.is_empty() { Vec::new() } else { vec![s] }
+    if s.is_empty() {
+        Vec::new()
+    } else {
+        vec![s]
+    }
 }
 
 fn first_quoted_value(text: &str) -> Option<String> {
@@ -145,11 +153,103 @@ fn first_quoted_value(text: &str) -> Option<String> {
     Some(tail[..end].to_string())
 }
 
+fn is_plausible_smsc(value: &str) -> bool {
+    let value = value.trim();
+    let digits = value.strip_prefix('+').unwrap_or(value);
+    (4..=20).contains(&digits.len())
+        && digits.chars().all(|c| c.is_ascii_digit())
+        && digits.chars().any(|c| c != '0')
+}
+
+fn normalize_smsc(value: &str) -> String {
+    let value = value
+        .trim()
+        .trim_matches(|c| matches!(c, '"' | '\'' | ',' | ';'))
+        .trim();
+    if is_plausible_smsc(value) {
+        value.to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn push_smsc_candidate(candidates: &mut Vec<String>, candidate: &str) {
+    let normalized = normalize_smsc(candidate);
+    if !normalized.is_empty() && !candidates.contains(&normalized) {
+        candidates.push(normalized);
+    }
+}
+
+fn extract_smsc_from_text(text: &str) -> String {
+    let mut plus_candidates = Vec::new();
+    let mut numeric_candidates = Vec::new();
+    let mut chars = text.char_indices().peekable();
+
+    while let Some((start, ch)) = chars.next() {
+        if ch != '+' && !ch.is_ascii_digit() {
+            continue;
+        }
+        let mut end = start + ch.len_utf8();
+        while let Some(&(idx, next)) = chars.peek() {
+            if next.is_ascii_digit() {
+                chars.next();
+                end = idx + next.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if ch == '+' {
+            push_smsc_candidate(&mut plus_candidates, &text[start..end]);
+        } else {
+            push_smsc_candidate(&mut numeric_candidates, &text[start..end]);
+        }
+    }
+
+    plus_candidates
+        .into_iter()
+        .next()
+        .or_else(|| numeric_candidates.into_iter().next())
+        .unwrap_or_default()
+}
+
 fn parse_smsc_from_at_output(output: &str) -> String {
     for line in output.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("+CSCA:") {
-            return first_quoted_value(trimmed).unwrap_or_default();
+        let Some(start) = line.find("+CSCA:") else {
+            continue;
+        };
+        let trimmed = line[start..].trim();
+        if let Some(value) = first_quoted_value(trimmed) {
+            let normalized = normalize_smsc(&value);
+            if !normalized.is_empty() {
+                return normalized;
+            }
+        }
+        let value = trimmed
+            .trim_start_matches("+CSCA:")
+            .split(',')
+            .next()
+            .unwrap_or_default();
+        let normalized = normalize_smsc(value);
+        if !normalized.is_empty() {
+            return normalized;
+        }
+    }
+    extract_smsc_from_text(output)
+}
+
+fn extract_smsc_property(props: &HashMap<String, OwnedValue>) -> String {
+    for key in [
+        "SMSC",
+        "Smsc",
+        "SmsCenter",
+        "DefaultSmsc",
+        "DefaultSmsCenter",
+    ] {
+        if let Some(value) = props.get(key) {
+            let smsc = normalize_smsc(&extract_string(value));
+            if !smsc.is_empty() {
+                return smsc;
+            }
         }
     }
     String::new()
@@ -172,6 +272,62 @@ fn operator_code_from_imsi(imsi: &str) -> String {
     } else {
         String::new()
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SimIdentity {
+    pub iccid: String,
+    pub imsi: String,
+    pub operator_id: String,
+}
+
+fn smsc_identity_keys(identity: &SimIdentity) -> Vec<String> {
+    let mut keys = Vec::new();
+    if !identity.iccid.is_empty() {
+        keys.push(format!("iccid:{}", identity.iccid));
+    }
+    if !identity.imsi.is_empty() {
+        keys.push(format!("imsi:{}", identity.imsi));
+    }
+    if !identity.operator_id.is_empty() {
+        keys.push(format!("operator:{}", identity.operator_id));
+    }
+    keys
+}
+
+pub fn cache_smsc_for_identity(
+    db: &Database,
+    identity: &SimIdentity,
+    sms_center: &str,
+    source: &str,
+) {
+    let sms_center = normalize_smsc(sms_center);
+    if sms_center.is_empty() {
+        return;
+    }
+    let Some(identity_key) = smsc_identity_keys(identity).into_iter().next() else {
+        return;
+    };
+    let _ = db.upsert_smsc_cache(
+        &identity_key,
+        &identity.iccid,
+        &identity.imsi,
+        &identity.operator_id,
+        &sms_center,
+        source,
+    );
+}
+
+fn cached_smsc_for_identity(db: &Database, identity: &SimIdentity) -> String {
+    let keys = smsc_identity_keys(identity);
+    if keys.is_empty() {
+        return String::new();
+    }
+    db.get_smsc_cache(&keys)
+        .ok()
+        .flatten()
+        .map(|entry| normalize_smsc(&entry.sms_center))
+        .unwrap_or_default()
 }
 
 fn extract_mode_pairs(value: &OwnedValue) -> Vec<(u32, u32)> {
@@ -501,6 +657,46 @@ async fn get_sim_path(conn: &Connection, modem_path: &str) -> zbus::Result<Strin
     Ok(path)
 }
 
+pub async fn current_sim_identity(conn: &Connection) -> Option<SimIdentity> {
+    let modem_path = find_modem_path(conn).await.ok()?;
+    let gpp_props = get_all_properties(conn, &modem_path, MM_MODEM_3GPP)
+        .await
+        .unwrap_or_default();
+    let sim_path = get_sim_path(conn, &modem_path).await.ok()?;
+    if sim_path.is_empty() || sim_path == "/" {
+        return None;
+    }
+    let sim_props = get_all_properties(conn, &sim_path, MM_SIM)
+        .await
+        .unwrap_or_default();
+    let iccid = sim_props
+        .get("SimIdentifier")
+        .map(extract_string)
+        .unwrap_or_default();
+    let imsi = sim_props
+        .get("Imsi")
+        .map(extract_string)
+        .unwrap_or_default();
+    let mut operator_id = sim_props
+        .get("OperatorIdentifier")
+        .map(extract_string)
+        .unwrap_or_default();
+    if operator_id.is_empty() {
+        operator_id = operator_code_from_imsi(&imsi);
+    }
+    if operator_id.is_empty() {
+        operator_id = gpp_props
+            .get("OperatorCode")
+            .map(extract_string)
+            .unwrap_or_default();
+    }
+    Some(SimIdentity {
+        iccid,
+        imsi,
+        operator_id,
+    })
+}
+
 fn mm_state_to_string(state: i32) -> &'static str {
     match state {
         -1 => "failed",
@@ -624,28 +820,159 @@ async fn messaging_smsc_fallback(conn: &Connection, modem_path: &str) -> String 
     let Ok(props) = get_all_properties(conn, modem_path, MM_MESSAGING).await else {
         return String::new();
     };
-    for key in ["Smsc", "DefaultSmsc", "SmsCenter", "DefaultSmsCenter"] {
-        if let Some(v) = props.get(key) {
-            let s = extract_string(v);
-            if !s.is_empty() {
-                return s;
-            }
+    extract_smsc_property(&props)
+}
+
+async fn sms_object_smsc(conn: &Connection, sms_path: &str) -> String {
+    let Ok(props) = get_all_properties(conn, sms_path, MM_SMS).await else {
+        return String::new();
+    };
+    extract_smsc_property(&props)
+}
+
+async fn existing_sms_smsc_fallback(conn: &Connection, modem_path: &str) -> String {
+    let Ok(proxy) = Proxy::new(conn, MM_SERVICE, modem_path, MM_MESSAGING).await else {
+        return String::new();
+    };
+    let Ok(paths) = proxy.call::<_, _, Vec<OwnedObjectPath>>("List", &()).await else {
+        return String::new();
+    };
+    for sms_path in paths.into_iter().take(30) {
+        let smsc = sms_object_smsc(conn, sms_path.as_str()).await;
+        if !smsc.is_empty() {
+            return smsc;
         }
     }
     String::new()
 }
 
-async fn at_smsc_fallback() -> String {
-    match run_recovery_command("mmcli", &["-m", "any", "--command=AT+CSCA?"]).await {
-        Ok(output) => parse_smsc_from_at_output(&output),
-        Err(err) => {
-            warn!(error = %err, "Failed to read SMSC via mmcli AT command");
-            String::new()
-        }
+async fn run_smsc_command(program: &str, args: Vec<String>) -> Result<String, String> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(SMSC_COMMAND_TIMEOUT_SECS),
+        Command::new(program).args(args).output(),
+    )
+    .await
+    .map_err(|_| "timeout".to_string())?
+    .map_err(|err| err.to_string())?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if output.status.success() {
+        Ok(stdout)
+    } else if stderr.is_empty() {
+        Err(format!("{program} exited with status {}", output.status))
+    } else {
+        Err(stderr)
     }
 }
 
-pub async fn get_sim_info_data(conn: &Connection) -> zbus::Result<SimInfoResponse> {
+async fn mbim_sms_config_smsc_fallback(conn: &Connection, modem_path: &str) -> String {
+    let Some(device) = mbim_control_device(conn, modem_path).await else {
+        return String::new();
+    };
+    let args = vec![
+        "-d".to_string(),
+        device,
+        "-p".to_string(),
+        "--sms-query-configuration".to_string(),
+    ];
+    let Ok(output) = with_serial(async { run_smsc_command("mbimcli", args).await }).await else {
+        return String::new();
+    };
+    extract_smsc_from_text(&output)
+}
+
+async fn qmi_wms_smsc_fallback(conn: &Connection, modem_path: &str) -> String {
+    let Some(device) = qmi_control_device(conn, modem_path).await else {
+        return String::new();
+    };
+    let args = vec![
+        "-p".to_string(),
+        "-d".to_string(),
+        device,
+        "--wms-get-smsc-address".to_string(),
+    ];
+    let Ok(output) = with_serial(async { run_smsc_command("qmicli", args).await }).await else {
+        return String::new();
+    };
+    extract_smsc_from_text(&output)
+}
+
+async fn qmi_atr_smsc_fallback(conn: &Connection, modem_path: &str) -> String {
+    let Some(device) = qmi_control_device(conn, modem_path).await else {
+        return String::new();
+    };
+    let args = vec![
+        "-p".to_string(),
+        "-d".to_string(),
+        device,
+        "--atr-send=AT+CSCA?".to_string(),
+    ];
+    let Ok(output) = with_serial(async { run_smsc_command("qmicli", args).await }).await else {
+        return String::new();
+    };
+    parse_smsc_from_at_output(&output)
+}
+
+async fn mbim_at_tunnel_smsc_fallback(conn: &Connection, modem_path: &str) -> String {
+    let Some(device) = mbim_control_device(conn, modem_path).await else {
+        return String::new();
+    };
+    for option in [
+        "--fibocom-set-at-command=AT+CSCA?",
+        "--compal-query-at-command=AT+CSCA?",
+        "--intel-at-tunnel-set-at-command=AT+CSCA?",
+    ] {
+        let args = vec![
+            "-d".to_string(),
+            device.clone(),
+            "-p".to_string(),
+            option.to_string(),
+        ];
+        let Ok(output) = with_serial(async { run_smsc_command("mbimcli", args).await }).await
+        else {
+            continue;
+        };
+        let smsc = parse_smsc_from_at_output(&output);
+        if !smsc.is_empty() {
+            return smsc;
+        }
+    }
+    String::new()
+}
+
+async fn direct_at_smsc_fallback(conn: &Connection) -> String {
+    let Ok(output) = with_serial(async { run_direct_at_command(conn, "AT+CSCA?").await }).await
+    else {
+        return String::new();
+    };
+    parse_smsc_from_at_output(&output)
+}
+
+async fn active_protocol_smsc_fallback(conn: &Connection, modem_path: &str) -> String {
+    let smsc = mbim_sms_config_smsc_fallback(conn, modem_path).await;
+    if !smsc.is_empty() {
+        return smsc;
+    }
+    let smsc = qmi_wms_smsc_fallback(conn, modem_path).await;
+    if !smsc.is_empty() {
+        return smsc;
+    }
+    let smsc = qmi_atr_smsc_fallback(conn, modem_path).await;
+    if !smsc.is_empty() {
+        return smsc;
+    }
+    let smsc = mbim_at_tunnel_smsc_fallback(conn, modem_path).await;
+    if !smsc.is_empty() {
+        return smsc;
+    }
+    direct_at_smsc_fallback(conn).await
+}
+
+pub async fn get_sim_info_data_with_cache(
+    conn: &Connection,
+    db: Option<&Database>,
+) -> zbus::Result<SimInfoResponse> {
     let modem_path = find_modem_path(conn).await?;
     let modem_props = get_all_properties(conn, &modem_path, MM_MODEM).await?;
     let gpp_props = get_all_properties(conn, &modem_path, MM_MODEM_3GPP).await?;
@@ -682,6 +1009,11 @@ pub async fn get_sim_info_data(conn: &Connection) -> zbus::Result<SimInfoRespons
             .map(extract_string)
             .unwrap_or_default();
     }
+    let identity = SimIdentity {
+        iccid: iccid.clone(),
+        imsi: imsi.clone(),
+        operator_id: operator_id.clone(),
+    };
     let (mcc, mnc) = split_operator_code(&operator_id);
 
     let mut phone_numbers: Vec<String> = Vec::new();
@@ -696,15 +1028,35 @@ pub async fn get_sim_info_data(conn: &Connection) -> zbus::Result<SimInfoRespons
     phone_numbers.sort();
     phone_numbers.dedup();
 
-    let mut sms_center = ["SmsCenter", "Smsc", "DefaultSmsc", "DefaultSmsCenter"]
-        .iter()
-        .find_map(|k| sim_props.get(*k).map(extract_string))
-        .unwrap_or_default();
+    let mut sms_center = extract_smsc_property(&sim_props);
     if sms_center.is_empty() {
         sms_center = msg_smsc;
     }
+    if !sms_center.is_empty() {
+        if let Some(db) = db {
+            cache_smsc_for_identity(db, &identity, &sms_center, "dbus");
+        }
+    }
     if sms_center.is_empty() {
-        sms_center = at_smsc_fallback().await;
+        sms_center = existing_sms_smsc_fallback(conn, &modem_path).await;
+        if !sms_center.is_empty() {
+            if let Some(db) = db {
+                cache_smsc_for_identity(db, &identity, &sms_center, "sms_object");
+            }
+        }
+    }
+    if sms_center.is_empty() {
+        if let Some(db) = db {
+            sms_center = cached_smsc_for_identity(db, &identity);
+        }
+    }
+    if sms_center.is_empty() {
+        sms_center = active_protocol_smsc_fallback(conn, &modem_path).await;
+        if !sms_center.is_empty() {
+            if let Some(db) = db {
+                cache_smsc_for_identity(db, &identity, &sms_center, "protocol");
+            }
+        }
     }
 
     Ok(SimInfoResponse {
@@ -856,6 +1208,10 @@ fn looks_like_qmi_control_port(port: &str) -> bool {
     p.contains("qmi") || p.contains("cdc-wdm")
 }
 
+fn looks_like_mbim_control_port(port: &str) -> bool {
+    port.to_ascii_lowercase().contains("mbim")
+}
+
 fn looks_like_at_port(port: &str) -> bool {
     port.to_ascii_lowercase().contains("at")
 }
@@ -876,13 +1232,28 @@ async fn at_command_device(conn: &Connection) -> Result<String, String> {
     let ports = Vec::<(String, u32)>::try_from(value).unwrap_or_default();
     ports
         .iter()
-        .find(|(_, port_type)| *port_type == 3)
+        .find(|(_, port_type)| *port_type == MM_MODEM_PORT_TYPE_AT)
         .or_else(|| ports.iter().find(|(port, _)| looks_like_at_port(port)))
         .map(|(port, _)| modem_device_path(port))
         .ok_or_else(|| "未找到 AT 端口（例如 /dev/wwan0at0）".to_string())
 }
 
+async fn modem_ports(conn: &Connection, modem_path: &str) -> Vec<(String, u32)> {
+    let Ok(value) = get_property(conn, modem_path, MM_MODEM, "Ports").await else {
+        return Vec::new();
+    };
+    Vec::<(String, u32)>::try_from(value).unwrap_or_default()
+}
+
 async fn qmi_control_device(conn: &Connection, modem_path: &str) -> Option<String> {
+    let ports = modem_ports(conn, modem_path).await;
+    if let Some((port, _)) = ports
+        .iter()
+        .find(|(_, port_type)| *port_type == MM_MODEM_PORT_TYPE_QMI)
+    {
+        return Some(qmi_device_path(port));
+    }
+
     if let Ok(value) = get_property(conn, modem_path, MM_MODEM, "PrimaryPort").await {
         let primary = extract_string(&value);
         if looks_like_qmi_control_port(&primary) {
@@ -890,15 +1261,34 @@ async fn qmi_control_device(conn: &Connection, modem_path: &str) -> Option<Strin
         }
     }
 
-    let value = get_property(conn, modem_path, MM_MODEM, "Ports")
-        .await
-        .ok()?;
-    let ports = Vec::<(String, u32)>::try_from(value).unwrap_or_default();
     ports
-        .into_iter()
+        .iter()
         .map(|(port, _)| port)
         .find(|port| looks_like_qmi_control_port(port))
-        .map(|port| qmi_device_path(&port))
+        .map(|port| qmi_device_path(port))
+}
+
+async fn mbim_control_device(conn: &Connection, modem_path: &str) -> Option<String> {
+    let ports = modem_ports(conn, modem_path).await;
+    if let Some((port, _)) = ports
+        .iter()
+        .find(|(_, port_type)| *port_type == MM_MODEM_PORT_TYPE_MBIM)
+    {
+        return Some(qmi_device_path(port));
+    }
+
+    if let Ok(value) = get_property(conn, modem_path, MM_MODEM, "PrimaryPort").await {
+        let primary = extract_string(&value);
+        if looks_like_mbim_control_port(&primary) {
+            return Some(qmi_device_path(&primary));
+        }
+    }
+
+    ports
+        .iter()
+        .map(|(port, _)| port)
+        .find(|port| looks_like_mbim_control_port(port))
+        .map(|port| qmi_device_path(port))
 }
 
 fn finish_qmicli_cell(
@@ -1130,6 +1520,34 @@ LTE Timing Advance: 'unavailable'"#;
         assert_eq!(parsed.cells[2].band, "B1");
         assert_eq!(parsed.cells[2].earfcn, "100");
         assert_eq!(parsed.cells[2].pci, "76");
+    }
+
+    #[test]
+    fn parses_smsc_from_direct_at_output() {
+        let output = "AT+CSCA?\r\r\n+CSCA: \"+8613800100500\",145\r\n\r\nOK\r\n";
+
+        assert_eq!(parse_smsc_from_at_output(output), "+8613800100500");
+    }
+
+    #[test]
+    fn parses_smsc_from_mmcli_wrapped_output() {
+        let output = "response: '+CSCA: \"+8613800100500\",145'";
+
+        assert_eq!(parse_smsc_from_at_output(output), "+8613800100500");
+    }
+
+    #[test]
+    fn extracts_smsc_from_protocol_output() {
+        let output = "SMSC Address\n  Type: 'international'\n  Number: '+34644109030'";
+
+        assert_eq!(extract_smsc_from_text(output), "+34644109030");
+    }
+
+    #[test]
+    fn rejects_short_smsc_candidates_from_protocol_output() {
+        let output = "SMSC Address\n  Type: '145'\n  State: '3'";
+
+        assert_eq!(extract_smsc_from_text(output), "");
     }
 
     #[test]
@@ -2000,7 +2418,11 @@ async fn set_modem_enabled(
     enabled: bool,
 ) -> Result<i32, String> {
     let desired_ready = |state: i32| {
-        if enabled { state >= 6 } else { state == 3 }
+        if enabled {
+            state >= 6
+        } else {
+            state == 3
+        }
     };
 
     for attempt in 0..5 {
