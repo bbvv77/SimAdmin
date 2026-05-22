@@ -15,8 +15,8 @@ use tokio::sync::Mutex;
 use crate::config::{ConfigManager, DdnsConfig, DdnsIpConfig};
 use crate::models::{
     DdnsEvent, DdnsLogEntry, DdnsLogsResponse, DdnsRecordSyncResult, DdnsStatusResponse,
-    DdnsSyncResponse, IpAddress, WlanConnectRequest, WlanEnabledRequest, WlanForgetRequest,
-    WlanNetwork, WlanProfileRequest, WlanProfilesResponse, WlanSavedNetwork, WlanScanResponse,
+    DdnsSyncResponse, WlanConnectRequest, WlanEnabledRequest, WlanForgetRequest, WlanNetwork,
+    WlanProfileRequest, WlanProfilesResponse, WlanSavedNetwork, WlanScanResponse,
     WlanStatusResponse,
 };
 use crate::notification::NotificationSender;
@@ -414,15 +414,6 @@ async fn get_ip_from_interface(
         .first()
         .map(|addr| addr.address.clone())
         .ok_or_else(|| format!("no {record_type} address found on {}", iface.name))
-}
-
-fn ddns_interface_addresses_for_record<'a>(
-    addresses: &'a [IpAddress],
-    record_type: &str,
-) -> Vec<&'a IpAddress> {
-    NetworkAddressFamily::from_ddns_record_type(record_type)
-        .map(|family| interface_addresses_for_family(addresses, family))
-        .unwrap_or_default()
 }
 
 async fn update_cloudflare(
@@ -1366,6 +1357,8 @@ fn unescape_nmcli(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::models::IpAddress;
+
     use super::*;
 
     #[test]
@@ -1438,7 +1431,7 @@ mod tests {
             },
         ];
 
-        let candidates = ddns_interface_addresses_for_record(&addresses, "AAAA");
+        let candidates = interface_addresses_for_family(&addresses, NetworkAddressFamily::Ipv6);
         let candidate_addresses: Vec<&str> = candidates
             .iter()
             .map(|addr| addr.address.as_str())

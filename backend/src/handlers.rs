@@ -2742,13 +2742,16 @@ pub async fn get_latest_ota_release_handler(
     Json(req): Json<crate::models::OtaOnlinePrepareRequest>,
 ) -> impl IntoResponse {
     let result: Result<crate::models::OtaLatestReleaseResponse, String> = async {
+        let include_builtin_proxies = req
+            .proxy_prefix
+            .as_ref()
+            .map(|prefix| !prefix.trim().is_empty())
+            .unwrap_or(false);
         let proxy_prefix = crate::ota::normalize_proxy_prefix(req.proxy_prefix);
-        let client = reqwest::Client::builder()
-            .user_agent("SimAdmin OTA updater")
-            .build()
-            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        let client = crate::ota::build_ota_http_client()?;
 
-        crate::ota::fetch_latest_github_release(&client, &proxy_prefix).await
+        crate::ota::fetch_latest_github_release(&client, &proxy_prefix, include_builtin_proxies)
+            .await
     }
     .await;
 
@@ -2772,13 +2775,20 @@ pub async fn prepare_online_ota_handler(
     Json(req): Json<crate::models::OtaOnlinePrepareRequest>,
 ) -> impl IntoResponse {
     let result: Result<crate::models::OtaUploadResponse, String> = async {
+        let include_builtin_proxies = req
+            .proxy_prefix
+            .as_ref()
+            .map(|prefix| !prefix.trim().is_empty())
+            .unwrap_or(false);
         let proxy_prefix = crate::ota::normalize_proxy_prefix(req.proxy_prefix);
-        let client = reqwest::Client::builder()
-            .user_agent("SimAdmin OTA updater")
-            .build()
-            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        let client = crate::ota::build_ota_http_client()?;
 
-        let release = crate::ota::fetch_latest_github_release(&client, &proxy_prefix).await?;
+        let release = crate::ota::fetch_latest_github_release(
+            &client,
+            &proxy_prefix,
+            include_builtin_proxies,
+        )
+        .await?;
 
         let asset = crate::ota::supported_release_asset(&release)
             .ok_or_else(|| "No supported OTA asset found in latest release".to_string())?;
@@ -2791,25 +2801,13 @@ pub async fn prepare_online_ota_handler(
             ));
         }
 
-        let download_url = format!("{}{}", proxy_prefix, asset.browser_download_url);
-        let bytes = client
-            .get(&download_url)
-            .send()
-            .await
-            .map_err(|e| format!("Failed to download OTA asset: {}", e))?
-            .error_for_status()
-            .map_err(|e| format!("OTA asset download failed: {}", e))?
-            .bytes()
-            .await
-            .map_err(|e| format!("Failed to read OTA asset: {}", e))?;
-
-        if bytes.len() as u64 > crate::ota::MAX_OTA_BYTES {
-            return Err(format!(
-                "OTA asset is too large: {} bytes exceeds {} bytes",
-                bytes.len(),
-                crate::ota::MAX_OTA_BYTES
-            ));
-        }
+        let bytes = crate::ota::download_ota_asset_bytes(
+            &client,
+            &proxy_prefix,
+            include_builtin_proxies,
+            asset,
+        )
+        .await?;
 
         crate::ota::handle_ota_upload(&bytes)
     }

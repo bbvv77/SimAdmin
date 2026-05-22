@@ -28,7 +28,13 @@ const NM_UNMANAGED_WWAN_CONFIG: &str = "[keyfile]\nunmanaged-devices=interface-n
 const LATEST_RELEASE_API: &str = "https://api.github.com/repos/3899/SimAdmin/releases/latest";
 const OTA_NOTICE_TMP_PREFIX: &str = "/tmp/simadmin_update_notice";
 const BEIJING_UTC_OFFSET_SECONDS: i32 = 8 * 60 * 60;
-const UPDATE_CHECK_HOUR: u32 = 10;
+const UPDATE_CHECK_HOURS: [u32; 2] = [9, 18];
+const OTA_HTTP_TIMEOUT_SECS: u64 = 30;
+const BUILTIN_PROXY_PREFIXES: [&str; 3] = [
+    "https://gh-proxy.com/",
+    "https://ghproxy.net/",
+    "https://githubproxy.cc/",
+];
 pub const MAX_OTA_BYTES: u64 = 50 * 1024 * 1024;
 
 /// 当前版本信息（编译时注入）
@@ -58,17 +64,26 @@ pub fn duration_until_next_update_check() -> Duration {
 fn duration_until_next_update_check_from(now_utc: DateTime<Utc>) -> Duration {
     let beijing = beijing_offset();
     let now = now_utc.with_timezone(&beijing);
-    let check_time =
-        NaiveTime::from_hms_opt(UPDATE_CHECK_HOUR, 0, 0).expect("valid update check time");
-    let today_check = beijing
-        .from_local_datetime(&now.date_naive().and_time(check_time))
-        .single()
-        .expect("fixed offset has a single local time");
-    let next_check = if now <= today_check {
-        today_check
-    } else {
-        today_check + chrono::Duration::days(1)
-    };
+
+    let next_check = UPDATE_CHECK_HOURS
+        .iter()
+        .filter_map(|hour| {
+            let check_time = NaiveTime::from_hms_opt(*hour, 0, 0)?;
+            beijing
+                .from_local_datetime(&now.date_naive().and_time(check_time))
+                .single()
+        })
+        .find(|check| now <= *check)
+        .unwrap_or_else(|| {
+            let check_time = NaiveTime::from_hms_opt(UPDATE_CHECK_HOURS[0], 0, 0)
+                .expect("valid update check time");
+            beijing
+                .from_local_datetime(
+                    &(now.date_naive() + chrono::Duration::days(1)).and_time(check_time),
+                )
+                .single()
+                .expect("fixed offset has a single local time")
+        });
 
     (next_check - now)
         .to_std()
@@ -90,6 +105,43 @@ pub fn normalize_proxy_prefix(prefix: Option<String>) -> String {
     }
 }
 
+pub fn build_ota_http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .user_agent("SimAdmin OTA updater")
+        .timeout(Duration::from_secs(OTA_HTTP_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))
+}
+
+fn push_proxy_url(urls: &mut Vec<String>, proxy_prefix: &str, url: &str) {
+    let proxy_prefix = normalize_proxy_prefix(Some(proxy_prefix.to_string()));
+    if proxy_prefix.is_empty() {
+        return;
+    }
+    let proxied_url = format!("{}{}", proxy_prefix, url);
+    if !urls.iter().any(|existing| existing == &proxied_url) {
+        urls.push(proxied_url);
+    }
+}
+
+pub fn ota_request_urls(
+    url: &str,
+    proxy_prefix: &str,
+    include_builtin_proxies: bool,
+) -> Vec<String> {
+    let mut urls = Vec::new();
+    push_proxy_url(&mut urls, proxy_prefix, url);
+
+    if include_builtin_proxies {
+        for builtin_proxy in BUILTIN_PROXY_PREFIXES {
+            push_proxy_url(&mut urls, builtin_proxy, url);
+        }
+    }
+
+    urls.push(url.to_string());
+    urls
+}
+
 pub fn is_supported_ota_asset(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower.ends_with(".tar.gz") || lower.ends_with(".tgz") || lower.ends_with(".zip")
@@ -105,14 +157,10 @@ pub fn supported_release_asset(release: &OtaLatestReleaseResponse) -> Option<&Ot
 pub async fn fetch_latest_github_release(
     client: &reqwest::Client,
     proxy_prefix: &str,
+    include_builtin_proxies: bool,
 ) -> Result<OtaLatestReleaseResponse, String> {
-    let mut urls = vec![LATEST_RELEASE_API.to_string()];
-    if !proxy_prefix.is_empty() {
-        urls.push(format!("{}{}", proxy_prefix, LATEST_RELEASE_API));
-    }
-
     let mut last_error = String::new();
-    for url in urls {
+    for url in ota_request_urls(LATEST_RELEASE_API, proxy_prefix, include_builtin_proxies) {
         match client
             .get(&url)
             .header("Accept", "application/vnd.github+json")
@@ -126,10 +174,13 @@ pub async fn fetch_latest_github_release(
                     last_error = format!("GitHub Releases request failed: HTTP {}", status);
                     continue;
                 }
-                return response
-                    .json::<OtaLatestReleaseResponse>()
-                    .await
-                    .map_err(|e| format!("Failed to parse latest release: {}", e));
+                match response.json::<OtaLatestReleaseResponse>().await {
+                    Ok(release) => return Ok(release),
+                    Err(e) => {
+                        last_error = format!("Failed to parse latest release: {}", e);
+                        continue;
+                    }
+                }
             }
             Err(e) => {
                 last_error = format!("Failed to request latest release: {}", e);
@@ -154,11 +205,8 @@ pub async fn check_and_notify_version_update(
     }
 
     let proxy_prefix = normalize_proxy_prefix(Some(update_config.proxy_prefix));
-    let client = reqwest::Client::builder()
-        .user_agent("SimAdmin OTA updater")
-        .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
-    let release = fetch_latest_github_release(&client, &proxy_prefix).await?;
+    let client = build_ota_http_client()?;
+    let release = fetch_latest_github_release(&client, &proxy_prefix, true).await?;
 
     if !compare_versions(&release.tag_name, CURRENT_VERSION) {
         return Ok(());
@@ -177,7 +225,7 @@ pub async fn check_and_notify_version_update(
 
     let asset = supported_release_asset(&release)
         .ok_or_else(|| "No supported OTA asset found in latest release".to_string())?;
-    let (meta, package_md5) = fetch_release_asset_meta(&client, &proxy_prefix, asset).await?;
+    let (meta, package_md5) = fetch_release_asset_meta(&client, &proxy_prefix, true, asset).await?;
     let event = VersionUpdateEvent {
         asset_name: asset.name.clone(),
         version: if meta.version.trim().is_empty() {
@@ -218,8 +266,23 @@ pub async fn check_and_notify_version_update(
 async fn fetch_release_asset_meta(
     client: &reqwest::Client,
     proxy_prefix: &str,
+    include_builtin_proxies: bool,
     asset: &OtaReleaseAsset,
 ) -> Result<(OtaMeta, String), String> {
+    let bytes = download_ota_asset_bytes(client, proxy_prefix, include_builtin_proxies, asset)
+        .await
+        .map_err(|e| e.replace("OTA asset download", "OTA asset metadata download"))?;
+    let package_md5 = format!("{:x}", md5::compute(&bytes));
+    let meta = read_ota_meta_from_archive(&asset.name, &bytes)?;
+    Ok((meta, package_md5))
+}
+
+pub async fn download_ota_asset_bytes(
+    client: &reqwest::Client,
+    proxy_prefix: &str,
+    include_builtin_proxies: bool,
+    asset: &OtaReleaseAsset,
+) -> Result<Vec<u8>, String> {
     if asset.size > MAX_OTA_BYTES {
         return Err(format!(
             "OTA asset is too large: {} bytes exceeds {} bytes",
@@ -227,29 +290,51 @@ async fn fetch_release_asset_meta(
         ));
     }
 
-    let download_url = format!("{}{}", proxy_prefix, asset.browser_download_url);
-    let bytes = client
-        .get(&download_url)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to download OTA asset metadata: {}", e))?
-        .error_for_status()
-        .map_err(|e| format!("OTA asset metadata download failed: {}", e))?
-        .bytes()
-        .await
-        .map_err(|e| format!("Failed to read OTA asset metadata: {}", e))?;
+    let mut last_error = String::new();
+    for download_url in ota_request_urls(
+        &asset.browser_download_url,
+        proxy_prefix,
+        include_builtin_proxies,
+    ) {
+        let response = match client.get(&download_url).send().await {
+            Ok(response) => response,
+            Err(e) => {
+                last_error = format!("Failed to download OTA asset: {}", e);
+                continue;
+            }
+        };
 
-    if bytes.len() as u64 > MAX_OTA_BYTES {
-        return Err(format!(
-            "OTA asset is too large: {} bytes exceeds {} bytes",
-            bytes.len(),
-            MAX_OTA_BYTES
-        ));
+        let status = response.status();
+        if !status.is_success() {
+            last_error = format!("OTA asset download failed: HTTP {}", status);
+            continue;
+        }
+
+        let bytes = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                last_error = format!("Failed to read OTA asset: {}", e);
+                continue;
+            }
+        };
+
+        if bytes.len() as u64 > MAX_OTA_BYTES {
+            last_error = format!(
+                "OTA asset is too large: {} bytes exceeds {} bytes",
+                bytes.len(),
+                MAX_OTA_BYTES
+            );
+            continue;
+        }
+
+        return Ok(bytes.to_vec());
     }
 
-    let package_md5 = format!("{:x}", md5::compute(&bytes));
-    let meta = read_ota_meta_from_archive(&asset.name, &bytes)?;
-    Ok((meta, package_md5))
+    if last_error.is_empty() {
+        Err("OTA asset download failed".to_string())
+    } else {
+        Err(last_error)
+    }
 }
 
 fn read_ota_meta_from_archive(asset_name: &str, data: &[u8]) -> Result<OtaMeta, String> {
@@ -749,17 +834,61 @@ mod tests {
     }
 
     #[test]
-    fn schedules_next_update_check_at_ten_beijing_time() {
-        let before_ten = Utc.with_ymd_and_hms(2026, 5, 15, 1, 59, 0).unwrap();
+    fn schedules_next_update_check_at_nine_and_eighteen_beijing_time() {
+        let before_nine = Utc.with_ymd_and_hms(2026, 5, 15, 0, 59, 0).unwrap();
         assert_eq!(
-            duration_until_next_update_check_from(before_ten),
+            duration_until_next_update_check_from(before_nine),
             Duration::from_secs(60)
         );
 
-        let after_ten = Utc.with_ymd_and_hms(2026, 5, 15, 2, 1, 0).unwrap();
+        let before_eighteen = Utc.with_ymd_and_hms(2026, 5, 15, 9, 59, 0).unwrap();
         assert_eq!(
-            duration_until_next_update_check_from(after_ten),
-            Duration::from_secs(23 * 60 * 60 + 59 * 60)
+            duration_until_next_update_check_from(before_eighteen),
+            Duration::from_secs(60)
+        );
+
+        let after_eighteen = Utc.with_ymd_and_hms(2026, 5, 15, 10, 1, 0).unwrap();
+        assert_eq!(
+            duration_until_next_update_check_from(after_eighteen),
+            Duration::from_secs(14 * 60 * 60 + 59 * 60)
+        );
+    }
+
+    #[test]
+    fn ota_request_urls_prefer_configured_proxy_then_builtin_then_direct() {
+        assert_eq!(
+            ota_request_urls("https://example.com/release", "https://proxy.local/", true),
+            vec![
+                "https://proxy.local/https://example.com/release".to_string(),
+                "https://gh-proxy.com/https://example.com/release".to_string(),
+                "https://ghproxy.net/https://example.com/release".to_string(),
+                "https://githubproxy.cc/https://example.com/release".to_string(),
+                "https://example.com/release".to_string()
+            ]
+        );
+        assert_eq!(
+            ota_request_urls("https://example.com/release", "https://gh-proxy.com", true),
+            vec![
+                "https://gh-proxy.com/https://example.com/release".to_string(),
+                "https://ghproxy.net/https://example.com/release".to_string(),
+                "https://githubproxy.cc/https://example.com/release".to_string(),
+                "https://example.com/release".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn ota_request_urls_can_skip_builtin_proxies() {
+        assert_eq!(
+            ota_request_urls("https://example.com/release", "", false),
+            vec!["https://example.com/release".to_string()]
+        );
+        assert_eq!(
+            ota_request_urls("https://example.com/release", "https://proxy.local", false),
+            vec![
+                "https://proxy.local/https://example.com/release".to_string(),
+                "https://example.com/release".to_string()
+            ]
         );
     }
 }

@@ -83,7 +83,7 @@ impl NotificationSender {
             get_sim_info_data_with_cache(self.dbus_conn.as_ref(), Some(self.database.as_ref()))
                 .await
                 .ok()
-                .map(|sim| sim.phone_numbers.join(", "))
+                .map(|sim| format_own_numbers_for_template(&sim.phone_numbers))
                 .unwrap_or_default();
 
         SmsTemplateContext { own_number }
@@ -1718,6 +1718,44 @@ fn render_sms_template(
         .replace("{{time}}", &timestamp)
 }
 
+fn format_own_numbers_for_template(numbers: &[String]) -> String {
+    numbers
+        .iter()
+        .map(|number| format_own_number_for_template(number))
+        .filter(|number| !number.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_own_number_for_template(number: &str) -> String {
+    let value = number
+        .trim()
+        .trim_matches(|c| matches!(c, '"' | '\'' | ',' | ';'))
+        .trim()
+        .strip_prefix("tel:")
+        .unwrap_or_else(|| number.trim());
+    let mut compact = String::new();
+
+    for ch in value.chars() {
+        if ch == '+' && compact.is_empty() {
+            compact.push(ch);
+        } else if ch.is_ascii_digit() {
+            compact.push(ch);
+        }
+    }
+
+    let has_plus = compact.starts_with('+');
+    let digits = compact.strip_prefix('+').unwrap_or(&compact);
+    if digits.len() == 13 && digits.starts_with("86") {
+        return digits[2..].to_string();
+    }
+    if !has_plus && !(digits.len() == 11 && digits.starts_with('1')) {
+        return format!("+{digits}");
+    }
+
+    compact
+}
+
 fn render_call_template(template: &str, call: &CallRecord, escape_json: bool) -> String {
     let start_time = render_time_value(&call.start_time, escape_json);
     let end_time = call
@@ -1870,6 +1908,31 @@ mod tests {
                 false
             ),
             "+10001|+10001|+10001|+10001"
+        );
+    }
+
+    #[test]
+    fn formats_own_number_variables_for_display() {
+        assert_eq!(
+            format_own_number_for_template("+8613112345678"),
+            "13112345678"
+        );
+        assert_eq!(
+            format_own_number_for_template("8613112345678"),
+            "13112345678"
+        );
+        assert_eq!(format_own_number_for_template("13112345678"), "13112345678");
+        assert_eq!(format_own_number_for_template("+4412345678"), "+4412345678");
+        assert_eq!(
+            format_own_number_for_template("447434452765"),
+            "+447434452765"
+        );
+        assert_eq!(
+            format_own_numbers_for_template(&[
+                "+8613112345678".to_string(),
+                "447434452765".to_string()
+            ]),
+            "13112345678, +447434452765"
         );
     }
 
