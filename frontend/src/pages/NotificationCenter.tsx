@@ -23,6 +23,9 @@ import type {
 import ErrorSnackbar from '../components/ErrorSnackbar'
 import NotificationChannelsTab from './notifications/NotificationChannelsTab'
 import NotificationLogsTab from './notifications/NotificationLogsTab'
+import NotificationQueueIndicator, {
+  type NotificationQueueItem,
+} from './notifications/NotificationQueueIndicator'
 import NotificationRulesTab from './notifications/NotificationRulesTab'
 import {
   createChannel,
@@ -59,6 +62,8 @@ export default function NotificationCenterPage() {
   const [saving, setSaving] = useState(false)
   const [cleanupSaving, setCleanupSaving] = useState(false)
   const [testing, setTesting] = useState(false)
+  const [queueOpen, setQueueOpen] = useState(false)
+  const [queueItems, setQueueItems] = useState<NotificationQueueItem[]>([])
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
   const logsLoadingRef = useRef(false)
@@ -68,6 +73,7 @@ export default function NotificationCenterPage() {
     () => config.channels.find((channel) => channel.id === selectedChannelId) ?? config.channels[0],
     [config.channels, selectedChannelId],
   )
+  const notificationQueueItems = queueItems
 
   const loadConfig = useCallback(async () => {
     setLoading(true)
@@ -108,9 +114,34 @@ export default function NotificationCenterPage() {
     }
   }, [logEndDate, logPage, logQuery, logStartDate, logStatus, logType])
 
+  const loadQueue = useCallback(async (silent = true) => {
+    try {
+      const response = await api.getNotificationQueue({ limit: 100 })
+      const items = response.data?.items ?? []
+      setQueueItems(items.map((item) => ({
+          id: item.id,
+          status: item.status,
+          event_type: item.event_type,
+          event_label: item.event_label,
+          summary: item.summary,
+          reason: item.reason,
+          channel_name: item.channel_name,
+          next_attempt_at: item.next_attempt_at,
+          attempt_count: item.attempt_count,
+          max_attempts: item.max_attempts,
+      })))
+    } catch (err) {
+      if (!silent) setError(err instanceof Error ? err.message : String(err))
+    }
+  }, [])
+
   useEffect(() => {
     void loadConfig()
   }, [loadConfig])
+
+  useEffect(() => {
+    void loadQueue()
+  }, [loadQueue])
 
   useEffect(() => {
     if (tab === 0) void loadLogs()
@@ -120,17 +151,20 @@ export default function NotificationCenterPage() {
     if (lastRefreshKeyRef.current === refreshKey) return
     lastRefreshKeyRef.current = refreshKey
     if (tab === 0) void loadLogs()
-  }, [loadLogs, refreshKey, tab])
+    void loadQueue()
+  }, [loadLogs, loadQueue, refreshKey, tab])
 
   useEffect(() => {
-    if (tab !== 0 || refreshInterval <= 0) return undefined
+    if (refreshInterval <= 0) return undefined
 
     const timer = window.setInterval(() => {
-      if (document.visibilityState === 'visible') void loadLogs(true)
+      if (document.visibilityState !== 'visible') return
+      if (tab === 0) void loadLogs(true)
+      void loadQueue(true)
     }, refreshInterval)
 
     return () => window.clearInterval(timer)
-  }, [loadLogs, refreshInterval, tab])
+  }, [loadLogs, loadQueue, refreshInterval, tab])
 
   useEffect(() => {
     const maxPage = Math.max(0, Math.ceil(logTotal / LOG_PAGE_SIZE) - 1)
@@ -266,6 +300,43 @@ export default function NotificationCenterPage() {
     }
   }
 
+  const handleRetryQueueItem = async (id: NotificationQueueItem['id']) => {
+    try {
+      await api.retryNotificationQueueItem(id)
+      await loadQueue(false)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  const handleDeleteQueueItem = async (id: NotificationQueueItem['id']) => {
+    try {
+      await api.deleteNotificationQueueItem(id)
+      await loadQueue(false)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  const handleRetryAllQueue = async () => {
+    try {
+      await api.retryAllNotificationQueue()
+      await loadQueue(false)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  const handleClearQueue = async () => {
+    try {
+      await api.clearNotificationQueue()
+      setQueueItems([])
+      await loadQueue(false)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }
+
   const handleLogTypeChange = (value: string) => {
     setLogType(value)
     setLogPage(0)
@@ -297,9 +368,21 @@ export default function NotificationCenterPage() {
 
   return (
     <Box>
-      <Box display="flex" alignItems="center" gap={1} mb={2}>
-        <NotificationsActive color="primary" />
-        <Typography variant="h5" fontWeight={700}>通知中心</Typography>
+      <Box display="flex" alignItems="center" gap={1} mb={2} flexWrap="wrap">
+        <Box display="flex" alignItems="center" gap={1}>
+          <NotificationsActive color="primary" />
+          <Typography variant="h5" fontWeight={700}>通知中心</Typography>
+        </Box>
+        <NotificationQueueIndicator
+          items={notificationQueueItems}
+          open={queueOpen}
+          onOpen={() => setQueueOpen(true)}
+          onClose={() => setQueueOpen(false)}
+          onRetry={(id) => void handleRetryQueueItem(id)}
+          onDelete={(id) => void handleDeleteQueueItem(id)}
+          onRetryAll={() => void handleRetryAllQueue()}
+          onDeleteAll={() => void handleClearQueue()}
+        />
       </Box>
 
       <ErrorSnackbar error={error} onClose={() => setError(null)} />

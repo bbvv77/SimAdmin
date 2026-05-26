@@ -5,14 +5,18 @@ use crate::config::{
     PushPlusConfig, QuietHoursSchedule, TelegramConfig, WebhookConfig, WecomAppConfig,
     WecomRobotConfig,
 };
-use crate::db::{CallRecord, Database, SmsMessage};
+use crate::db::{
+    CallRecord, Database, NewNotificationQueueItem, NotificationQueueEntry, SmsMessage,
+};
 use crate::device_status::DeviceStatusReport;
 use crate::models::{DdnsEvent, VersionUpdateEvent};
 use crate::modem_manager::get_sim_info_data_with_cache;
 use crate::system_event::SystemEvent;
 use crate::verification_code::extract_verification_code;
 use base64::{engine::general_purpose, Engine as _};
-use chrono::{DateTime, Datelike, FixedOffset, NaiveDateTime, Timelike, Utc};
+use chrono::{
+    DateTime, Datelike, Duration as ChronoDuration, FixedOffset, NaiveDateTime, Timelike, Utc,
+};
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use reqwest::{Client, StatusCode};
 use ring::hmac;
@@ -68,6 +72,11 @@ struct NotificationRouteResult {
     delivered: bool,
     has_failures: bool,
     errors: Vec<String>,
+}
+
+enum ChannelDeliveryResult {
+    Sent(String),
+    Queued(String),
 }
 
 enum NotificationEvent<'a> {
@@ -492,12 +501,34 @@ impl NotificationSender {
                 }
 
                 let title = event.title();
-                match self.send_text_to_channel(channel, &title, &text).await {
-                    Ok(message) => {
+                match self
+                    .send_text_to_channel_with_queue(
+                        event,
+                        rule,
+                        channel,
+                        &title,
+                        &text,
+                        log_summary,
+                    )
+                    .await
+                {
+                    Ok(ChannelDeliveryResult::Sent(message)) => {
                         result.delivered = true;
                         self.record_notification_log(
                             event.event_type(),
                             "success",
+                            log_summary,
+                            Some(rule),
+                            Some(channel),
+                            &message,
+                        );
+                    }
+                    Ok(ChannelDeliveryResult::Queued(message)) => {
+                        result.has_failures = true;
+                        result.errors.push(format!("{}: {}", channel.name, message));
+                        self.record_notification_log(
+                            event.event_type(),
+                            "failed",
                             log_summary,
                             Some(rule),
                             Some(channel),
@@ -552,10 +583,33 @@ impl NotificationSender {
         let (channel_id, channel_name) = channel
             .map(|channel| (channel.id.as_str(), channel.name.as_str()))
             .unwrap_or(("", ""));
+        self.record_notification_log_raw(
+            notification_event_type_key(event_type),
+            status,
+            summary,
+            rule_id,
+            rule_name,
+            channel_id,
+            channel_name,
+            message,
+        );
+    }
+
+    fn record_notification_log_raw(
+        &self,
+        event_type: &str,
+        status: &str,
+        summary: &str,
+        rule_id: &str,
+        rule_name: &str,
+        channel_id: &str,
+        channel_name: &str,
+        message: &str,
+    ) {
         if let Err(err) = self
             .database
             .insert_notification_log(crate::db::NewNotificationLog {
-                event_type: notification_event_type_key(event_type),
+                event_type,
                 status,
                 summary,
                 rule_id,
@@ -608,6 +662,226 @@ impl NotificationSender {
         }
 
         matched_rules > 0
+    }
+
+    async fn send_text_to_channel_with_queue(
+        &self,
+        event: &NotificationEvent<'_>,
+        rule: &NotificationRule,
+        channel: &NotificationChannelInstance,
+        title: &str,
+        text: &str,
+        summary: &str,
+    ) -> Result<ChannelDeliveryResult, String> {
+        if let Some(reason) = self.rate_limit_reason(channel)? {
+            let next_attempt_at =
+                beijing_time_after_seconds(i64::from(channel.rate_limit.window_seconds.max(1)));
+            self.enqueue_notification(
+                event,
+                rule,
+                channel,
+                title,
+                text,
+                summary,
+                "scheduled",
+                &reason,
+                &next_attempt_at,
+            )?;
+            return Ok(ChannelDeliveryResult::Queued(reason));
+        }
+
+        match self.send_text_to_channel(channel, title, text).await {
+            Ok(message) => Ok(ChannelDeliveryResult::Sent(message)),
+            Err(err) => {
+                let next_attempt_at = beijing_time_after_seconds(60);
+                let reason = format!("发送失败，已加入通知队列：{err}");
+                self.enqueue_notification(
+                    event,
+                    rule,
+                    channel,
+                    title,
+                    text,
+                    summary,
+                    "retrying",
+                    &reason,
+                    &next_attempt_at,
+                )?;
+                Ok(ChannelDeliveryResult::Queued(reason))
+            }
+        }
+    }
+
+    fn rate_limit_reason(
+        &self,
+        channel: &NotificationChannelInstance,
+    ) -> Result<Option<String>, String> {
+        let limit = &channel.rate_limit;
+        if !limit.enabled {
+            return Ok(None);
+        }
+
+        let max_messages = limit.max_messages.max(1);
+        let window_seconds = limit.window_seconds.max(1);
+        let since = Utc::now()
+            .with_timezone(&beijing_offset())
+            .checked_sub_signed(ChronoDuration::seconds(i64::from(window_seconds)))
+            .unwrap_or_else(|| Utc::now().with_timezone(&beijing_offset()))
+            .format(NOTIFICATION_TIME_FORMAT)
+            .to_string();
+        let count = self
+            .database
+            .notification_channel_success_count_since(&channel.id, &since)
+            .map_err(|err| format!("读取通道发送频率失败：{err}"))?;
+
+        if count >= i64::from(max_messages) {
+            Ok(Some(format!(
+                "触发队列保护：{} 秒内最多发送 {} 条",
+                window_seconds, max_messages
+            )))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn enqueue_notification(
+        &self,
+        event: &NotificationEvent<'_>,
+        rule: &NotificationRule,
+        channel: &NotificationChannelInstance,
+        title: &str,
+        body: &str,
+        summary: &str,
+        status: &str,
+        reason: &str,
+        next_attempt_at: &str,
+    ) -> Result<i64, String> {
+        self.database
+            .insert_notification_queue_item(NewNotificationQueueItem {
+                status,
+                event_type: notification_event_type_key(event.event_type()),
+                event_label: event.event_type().label(),
+                summary,
+                reason,
+                rule_id: &rule.id,
+                rule_name: &rule.name,
+                channel_id: &channel.id,
+                channel_name: &channel.name,
+                channel_type: channel.channel_type.key(),
+                title,
+                body,
+                next_attempt_at,
+                max_attempts: 5,
+            })
+            .map_err(|err| format!("写入通知队列失败：{err}"))
+    }
+
+    pub async fn run_queue_worker(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            interval.tick().await;
+            let items = match self.database.get_due_notification_queue_items(20) {
+                Ok(items) => items,
+                Err(err) => {
+                    warn!(error = %err, "Failed to load due notification queue items");
+                    continue;
+                }
+            };
+
+            for item in items {
+                let self_clone = Arc::clone(&self);
+                tokio::spawn(async move {
+                    self_clone.process_notification_queue_item(item).await;
+                });
+            }
+        }
+    }
+
+    async fn process_notification_queue_item(&self, item: NotificationQueueEntry) {
+        if self
+            .database
+            .mark_notification_queue_sending(item.id)
+            .unwrap_or(0)
+            == 0
+        {
+            return;
+        }
+
+        let config = self.get_config();
+        let Some(channel) = config
+            .channels
+            .iter()
+            .find(|channel| channel.id == item.channel_id && channel.enabled)
+        else {
+            let err = "通知通道不存在或已停用";
+            self.finish_queue_item_failed(item, err);
+            return;
+        };
+
+        if let Ok(Some(reason)) = self.rate_limit_reason(channel) {
+            let next_attempt_at =
+                beijing_time_after_seconds(i64::from(channel.rate_limit.window_seconds.max(1)));
+            if let Err(err) =
+                self.database
+                    .mark_notification_queue_scheduled(item.id, &reason, &next_attempt_at)
+            {
+                warn!(error = %err, id = item.id, "Failed to reschedule notification queue item");
+            }
+            return;
+        }
+
+        match self
+            .send_text_to_channel(channel, &item.title, &item.body)
+            .await
+        {
+            Ok(message) => {
+                if let Err(err) = self.database.mark_notification_queue_sent(item.id) {
+                    warn!(error = %err, id = item.id, "Failed to mark notification queue item sent");
+                }
+                self.record_notification_log_raw(
+                    &item.event_type,
+                    "success",
+                    &item.summary,
+                    &item.rule_id,
+                    &item.rule_name,
+                    &channel.id,
+                    &channel.name,
+                    &message,
+                );
+            }
+            Err(err) => {
+                let next_attempt = item.attempt_count + 1;
+                if next_attempt >= item.max_attempts {
+                    self.finish_queue_item_failed(item, &err);
+                } else {
+                    let backoff = retry_backoff_seconds(next_attempt);
+                    let next_attempt_at = beijing_time_after_seconds(backoff);
+                    if let Err(db_err) =
+                        self.database
+                            .mark_notification_queue_retry(item.id, &err, &next_attempt_at)
+                    {
+                        warn!(error = %db_err, id = item.id, "Failed to mark notification queue item retrying");
+                    }
+                }
+            }
+        }
+    }
+
+    fn finish_queue_item_failed(&self, item: NotificationQueueEntry, err: &str) {
+        if let Err(db_err) = self.database.mark_notification_queue_failed(item.id, err) {
+            warn!(error = %db_err, id = item.id, "Failed to mark notification queue item failed");
+        }
+        self.record_notification_log_raw(
+            &item.event_type,
+            "failed",
+            &item.summary,
+            &item.rule_id,
+            &item.rule_name,
+            &item.channel_id,
+            &item.channel_name,
+            err,
+        );
     }
 
     async fn send_text_to_channel(
@@ -1925,6 +2199,32 @@ fn notification_event_type_key(event_type: NotificationEventType) -> &'static st
     }
 }
 
+impl NotificationEventType {
+    fn label(self) -> &'static str {
+        match self {
+            NotificationEventType::Sms => "短信",
+            NotificationEventType::Ddns => "DDNS",
+            NotificationEventType::VersionUpdate => "版本更新",
+            NotificationEventType::SystemEvent => "系统事件",
+            NotificationEventType::DeviceStatus => "设备状态",
+        }
+    }
+}
+
+fn beijing_time_after_seconds(seconds: i64) -> String {
+    Utc::now()
+        .with_timezone(&beijing_offset())
+        .checked_add_signed(ChronoDuration::seconds(seconds.max(1)))
+        .unwrap_or_else(|| Utc::now().with_timezone(&beijing_offset()))
+        .format(NOTIFICATION_TIME_FORMAT)
+        .to_string()
+}
+
+fn retry_backoff_seconds(attempt_count: i64) -> i64 {
+    let exponent = attempt_count.saturating_sub(1).clamp(0, 5) as u32;
+    (60_i64 * 2_i64.pow(exponent)).min(3600)
+}
+
 fn compact_summary(value: &str) -> String {
     let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut chars = collapsed.chars();
@@ -1938,6 +2238,20 @@ fn compact_summary(value: &str) -> String {
 
 #[allow(dead_code)]
 impl NotificationChannel {
+    fn key(self) -> &'static str {
+        match self {
+            NotificationChannel::Webhook => "webhook",
+            NotificationChannel::Bark => "bark",
+            NotificationChannel::PushPlus => "pushplus",
+            NotificationChannel::WecomApp => "wecom_app",
+            NotificationChannel::WecomRobot => "wecom_robot",
+            NotificationChannel::DingtalkRobot => "dingtalk_robot",
+            NotificationChannel::DingtalkApp => "dingtalk_app",
+            NotificationChannel::FeishuRobot => "feishu_robot",
+            NotificationChannel::Telegram => "telegram",
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             NotificationChannel::Webhook => "Webhook",

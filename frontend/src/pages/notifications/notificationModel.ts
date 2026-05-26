@@ -19,6 +19,7 @@ import type {
   NotificationEventType,
   NotificationLogCleanupConfig,
   NotificationLogStatus,
+  NotificationRateLimitConfig,
   NotificationRule,
   QuietHoursSchedule,
 } from '../../api/current'
@@ -51,6 +52,34 @@ export const DEFAULT_LOG_CLEANUP: NotificationLogCleanupConfig = {
   retention_days: 90,
   max_entries_enabled: false,
   max_entries: 10000,
+}
+
+export const DEFAULT_RATE_LIMIT: NotificationRateLimitConfig = {
+  enabled: true,
+  max_messages: 20,
+  window_seconds: 60,
+}
+
+export function defaultRateLimitForChannel(type: NotificationChannelKey): NotificationRateLimitConfig {
+  switch (type) {
+    case 'webhook':
+    case 'bark':
+      return { enabled: false, max_messages: 60, window_seconds: 60 }
+    case 'pushplus':
+      return { enabled: true, max_messages: 5, window_seconds: 60 }
+    case 'wecom_app':
+      return { enabled: true, max_messages: 30, window_seconds: 60 }
+    case 'wecom_robot':
+    case 'dingtalk_robot':
+    case 'telegram':
+      return { enabled: true, max_messages: 20, window_seconds: 60 }
+    case 'dingtalk_app':
+      return { enabled: true, max_messages: 1000, window_seconds: 60 }
+    case 'feishu_robot':
+      return { enabled: true, max_messages: 5, window_seconds: 1 }
+    default:
+      return { ...DEFAULT_RATE_LIMIT }
+  }
 }
 
 export const CHANNEL_DEFS: ChannelDef[] = [
@@ -180,11 +209,27 @@ function normalizeRule(rule: NotificationRule): NotificationRule {
   }
 }
 
+function normalizeRateLimit(value?: Partial<NotificationRateLimitConfig> | null): NotificationRateLimitConfig {
+  const merged = { ...DEFAULT_RATE_LIMIT, ...(value ?? {}) }
+  return {
+    enabled: merged.enabled !== false,
+    max_messages: Math.max(1, Math.trunc(Number(merged.max_messages) || DEFAULT_RATE_LIMIT.max_messages)),
+    window_seconds: Math.max(1, Math.trunc(Number(merged.window_seconds) || DEFAULT_RATE_LIMIT.window_seconds)),
+  }
+}
+
+function normalizeChannel(channel: NotificationChannelInstance): NotificationChannelInstance {
+  return {
+    ...channel,
+    rate_limit: normalizeRateLimit(channel.rate_limit),
+  }
+}
+
 export function normalizeConfig(value?: NotificationConfig | null): NotificationConfig {
   if (!value) return createDefaultConfig()
   return {
     version: 2,
-    channels: Array.isArray(value.channels) ? value.channels : [],
+    channels: Array.isArray(value.channels) ? value.channels.map(normalizeChannel) : [],
     rules: Array.isArray(value.rules) ? value.rules.map(normalizeRule) : [],
     log_cleanup: { ...DEFAULT_LOG_CLEANUP, ...(value.log_cleanup ?? {}) },
   }
@@ -277,6 +322,7 @@ export function createChannel(type: NotificationChannelKey): NotificationChannel
     type,
     name: def.label,
     enabled: true,
+    rate_limit: defaultRateLimitForChannel(type),
     config: defaultChannelConfig(type),
   }
 }

@@ -38,6 +38,7 @@ import type {
   NetworkInterfacesResponse,
   NotificationConfig,
   NotificationLogsResponse,
+  NotificationQueueResponse,
   OperatorListResponse,
   OtaStatusResponse,
   OtaLatestReleaseResponse,
@@ -722,6 +723,37 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<{ deleted: number }>>('/notifications/logs/clear', {
       method: 'POST',
       body: JSON.stringify(filters ?? {}),
+    })
+  }
+
+  async getNotificationQueue(params?: { limit?: number }) {
+    const query = new URLSearchParams()
+    if (params?.limit) query.append('limit', params.limit.toString())
+    const queryStr = query.toString() ? `?${query.toString()}` : ''
+    return request<ApiResponse<NotificationQueueResponse>>(`/notifications/queue${queryStr}`)
+  }
+
+  async retryNotificationQueueItem(id: number | string) {
+    return request<ApiResponse<{ updated: number }>>(`/notifications/queue/${id}/retry`, {
+      method: 'POST',
+    })
+  }
+
+  async deleteNotificationQueueItem(id: number | string) {
+    return request<ApiResponse<{ updated: number }>>(`/notifications/queue/${id}`, {
+      method: 'DELETE',
+    })
+  }
+
+  async retryAllNotificationQueue() {
+    return request<ApiResponse<{ updated: number }>>('/notifications/queue/retry-all', {
+      method: 'POST',
+    })
+  }
+
+  async clearNotificationQueue() {
+    return request<ApiResponse<{ updated: number }>>('/notifications/queue/clear', {
+      method: 'POST',
     })
   }
 

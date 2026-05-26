@@ -93,6 +93,51 @@ pub struct NewNotificationLog<'a> {
     pub message: &'a str,
 }
 
+pub struct NewNotificationQueueItem<'a> {
+    pub status: &'a str,
+    pub event_type: &'a str,
+    pub event_label: &'a str,
+    pub summary: &'a str,
+    pub reason: &'a str,
+    pub rule_id: &'a str,
+    pub rule_name: &'a str,
+    pub channel_id: &'a str,
+    pub channel_name: &'a str,
+    pub channel_type: &'a str,
+    pub title: &'a str,
+    pub body: &'a str,
+    pub next_attempt_at: &'a str,
+    pub max_attempts: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationQueueEntry {
+    pub id: i64,
+    pub status: String,
+    pub event_type: String,
+    pub event_label: String,
+    pub summary: String,
+    pub reason: String,
+    pub channel_id: String,
+    pub channel_name: String,
+    pub channel_type: String,
+    pub rule_id: String,
+    pub rule_name: String,
+    pub title: String,
+    pub body: String,
+    pub next_attempt_at: String,
+    pub attempt_count: i64,
+    pub max_attempts: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NotificationQueueResponse {
+    pub items: Vec<NotificationQueueEntry>,
+    pub total: i64,
+}
+
 /// 通话统计
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct CallStats {
@@ -359,6 +404,42 @@ impl Database {
         )?;
 
         // 创建通话记录表（如果不存在）
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS notification_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                status TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                event_label TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                rule_id TEXT NOT NULL DEFAULT '',
+                rule_name TEXT NOT NULL DEFAULT '',
+                channel_id TEXT NOT NULL,
+                channel_name TEXT NOT NULL,
+                channel_type TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                body TEXT NOT NULL DEFAULT '',
+                next_attempt_at TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 5,
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL DEFAULT ''
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notification_queue_status_next_attempt
+             ON notification_queue(status, next_attempt_at, id)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notification_queue_channel_status
+             ON notification_queue(channel_id, status, next_attempt_at)",
+            [],
+        )?;
+
         conn.execute(
             "CREATE TABLE IF NOT EXISTS call_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -750,6 +831,55 @@ impl Database {
         )
     }
 
+    pub fn insert_notification_queue_item(
+        &self,
+        item: NewNotificationQueueItem<'_>,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let now = beijing_sms_now_string();
+        conn.execute(
+            "INSERT INTO notification_queue (
+                status, event_type, event_label, summary, reason,
+                rule_id, rule_name, channel_id, channel_name, channel_type,
+                title, body, next_attempt_at, max_attempts, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)",
+            params![
+                item.status,
+                item.event_type,
+                item.event_label,
+                item.summary,
+                item.reason,
+                item.rule_id,
+                item.rule_name,
+                item.channel_id,
+                item.channel_name,
+                item.channel_type,
+                item.title,
+                item.body,
+                item.next_attempt_at,
+                item.max_attempts,
+                now,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn notification_channel_success_count_since(
+        &self,
+        channel_id: &str,
+        since: &str,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM notification_logs
+             WHERE status = 'success'
+               AND channel_id = ?1
+               AND created_at >= ?2",
+            params![channel_id, since],
+            |row| row.get(0),
+        )
+    }
+
     pub fn get_notification_logs(
         &self,
         event_type: &str,
@@ -850,6 +980,238 @@ impl Database {
                AND (?3 = '' OR created_at >= ?3)
                AND (?4 = '' OR created_at <= ?4)",
             params![event_type, status, start_at, end_at],
+        )
+    }
+
+    pub fn get_notification_queue(&self, limit: i64) -> Result<NotificationQueueResponse> {
+        let conn = self.conn.lock().unwrap();
+        let limit = limit.clamp(1, 500);
+
+        let total = conn.query_row(
+            "SELECT COUNT(*) FROM notification_queue
+             WHERE status IN ('pending', 'scheduled', 'retrying', 'sending', 'failed')",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let mut stmt = conn.prepare(
+            "SELECT id, status, event_type, event_label, summary,
+                    COALESCE(NULLIF(last_error, ''), reason) AS display_reason,
+                    channel_id, channel_name, channel_type, rule_id, rule_name,
+                    title, body, next_attempt_at,
+                    attempt_count, max_attempts, created_at, updated_at
+             FROM notification_queue
+             WHERE status IN ('pending', 'scheduled', 'retrying', 'sending', 'failed')
+             ORDER BY next_attempt_at ASC, id ASC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            Ok(NotificationQueueEntry {
+                id: row.get(0)?,
+                status: row.get(1)?,
+                event_type: row.get(2)?,
+                event_label: row.get(3)?,
+                summary: row.get(4)?,
+                reason: row.get(5)?,
+                channel_id: row.get(6)?,
+                channel_name: row.get(7)?,
+                channel_type: row.get(8)?,
+                rule_id: row.get(9)?,
+                rule_name: row.get(10)?,
+                title: row.get(11)?,
+                body: row.get(12)?,
+                next_attempt_at: row.get(13)?,
+                attempt_count: row.get(14)?,
+                max_attempts: row.get(15)?,
+                created_at: row.get(16)?,
+                updated_at: row.get(17)?,
+            })
+        })?;
+
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row?);
+        }
+
+        Ok(NotificationQueueResponse { items, total })
+    }
+
+    pub fn retry_notification_queue_item(&self, id: i64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let now = beijing_sms_now_string();
+        conn.execute(
+            "UPDATE notification_queue
+             SET status = 'pending',
+                 attempt_count = 0,
+                 next_attempt_at = ?1,
+                 last_error = '',
+                 updated_at = ?1
+             WHERE id = ?2
+               AND status IN ('pending', 'scheduled', 'retrying', 'sending', 'failed')",
+            params![now, id],
+        )
+    }
+
+    pub fn delete_notification_queue_item(&self, id: i64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE notification_queue
+             SET status = 'cancelled',
+                 updated_at = ?1
+             WHERE id = ?2
+               AND status IN ('pending', 'scheduled', 'retrying', 'sending', 'failed')",
+            params![beijing_sms_now_string(), id],
+        )
+    }
+
+    pub fn retry_all_notification_queue_items(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let now = beijing_sms_now_string();
+        conn.execute(
+            "UPDATE notification_queue
+             SET status = 'pending',
+                 attempt_count = 0,
+                 next_attempt_at = ?1,
+                 last_error = '',
+                 updated_at = ?1
+             WHERE status IN ('pending', 'scheduled', 'retrying', 'sending', 'failed')",
+            params![now],
+        )
+    }
+
+    pub fn clear_active_notification_queue(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE notification_queue
+             SET status = 'cancelled',
+                 updated_at = ?1
+             WHERE status IN ('pending', 'scheduled', 'retrying', 'sending', 'failed')",
+            params![beijing_sms_now_string()],
+        )
+    }
+
+    pub fn get_due_notification_queue_items(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<NotificationQueueEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let now = beijing_sms_now_string();
+        let limit = limit.clamp(1, 100);
+        let mut stmt = conn.prepare(
+            "SELECT id, status, event_type, event_label, summary,
+                    COALESCE(NULLIF(last_error, ''), reason) AS display_reason,
+                    channel_id, channel_name, channel_type, rule_id, rule_name,
+                    title, body, next_attempt_at,
+                    attempt_count, max_attempts, created_at, updated_at
+             FROM notification_queue
+             WHERE status IN ('pending', 'scheduled', 'retrying')
+               AND next_attempt_at <= ?1
+             ORDER BY next_attempt_at ASC, id ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![now, limit], |row| {
+            Ok(NotificationQueueEntry {
+                id: row.get(0)?,
+                status: row.get(1)?,
+                event_type: row.get(2)?,
+                event_label: row.get(3)?,
+                summary: row.get(4)?,
+                reason: row.get(5)?,
+                channel_id: row.get(6)?,
+                channel_name: row.get(7)?,
+                channel_type: row.get(8)?,
+                rule_id: row.get(9)?,
+                rule_name: row.get(10)?,
+                title: row.get(11)?,
+                body: row.get(12)?,
+                next_attempt_at: row.get(13)?,
+                attempt_count: row.get(14)?,
+                max_attempts: row.get(15)?,
+                created_at: row.get(16)?,
+                updated_at: row.get(17)?,
+            })
+        })?;
+
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row?);
+        }
+        Ok(items)
+    }
+
+    pub fn mark_notification_queue_sending(&self, id: i64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE notification_queue
+             SET status = 'sending',
+                 updated_at = ?1
+             WHERE id = ?2
+               AND status IN ('pending', 'scheduled', 'retrying')",
+            params![beijing_sms_now_string(), id],
+        )
+    }
+
+    pub fn mark_notification_queue_sent(&self, id: i64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE notification_queue
+             SET status = 'sent',
+                 last_error = '',
+                 updated_at = ?1
+             WHERE id = ?2",
+            params![beijing_sms_now_string(), id],
+        )
+    }
+
+    pub fn mark_notification_queue_retry(
+        &self,
+        id: i64,
+        last_error: &str,
+        next_attempt_at: &str,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let now = beijing_sms_now_string();
+        conn.execute(
+            "UPDATE notification_queue
+             SET status = 'retrying',
+                 attempt_count = attempt_count + 1,
+                 last_error = ?1,
+                 next_attempt_at = ?2,
+                 updated_at = ?3
+             WHERE id = ?4",
+            params![last_error, next_attempt_at, now, id],
+        )
+    }
+
+    pub fn mark_notification_queue_scheduled(
+        &self,
+        id: i64,
+        reason: &str,
+        next_attempt_at: &str,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let now = beijing_sms_now_string();
+        conn.execute(
+            "UPDATE notification_queue
+             SET status = 'scheduled',
+                 reason = ?1,
+                 next_attempt_at = ?2,
+                 updated_at = ?3
+             WHERE id = ?4",
+            params![reason, next_attempt_at, now, id],
+        )
+    }
+
+    pub fn mark_notification_queue_failed(&self, id: i64, last_error: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE notification_queue
+             SET status = 'failed',
+                 attempt_count = attempt_count + 1,
+                 last_error = ?1,
+                 updated_at = ?2
+             WHERE id = ?3",
+            params![last_error, beijing_sms_now_string(), id],
         )
     }
 

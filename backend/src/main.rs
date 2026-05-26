@@ -36,6 +36,7 @@ mod iptables;
 mod models;
 mod modem_manager;
 mod notification;
+mod notification_queue;
 mod ota;
 mod serial;
 mod sms_listener;
@@ -52,6 +53,7 @@ use esim::EsimSupervisor;
 use handlers::*;
 use modem_manager::{ensure_nm_modem_profile, init_data_connection};
 use notification::NotificationSender;
+use notification_queue::*;
 use state::AppState;
 use system_event::{
     codes as system_event_codes, severity as system_event_severity, status as system_event_status,
@@ -337,6 +339,12 @@ async fn main() -> Result<()> {
     let system_event_emitter = Arc::new(SystemEventEmitter::new(Arc::clone(&notification_sender)));
     let (sms_resync, sms_resync_rx) = sms_listener::sms_resync_channel();
     let ddns_manager = Arc::new(DdnsManager::new());
+    {
+        let notification_queue_worker = Arc::clone(&notification_sender);
+        tokio::spawn(async move {
+            notification_queue_worker.run_queue_worker().await;
+        });
+    }
     system_event_monitor::spawn_system_event_monitor(
         Arc::clone(&system_event_emitter),
         Arc::clone(&dbus_conn),
@@ -812,6 +820,26 @@ async fn main() -> Result<()> {
         .route(
             "/api/notifications/logs/clear",
             post(clear_notification_logs_handler).options(options_handler),
+        )
+        .route(
+            "/api/notifications/queue",
+            get(get_notification_queue_handler).options(options_handler),
+        )
+        .route(
+            "/api/notifications/queue/retry-all",
+            post(retry_all_notification_queue_handler).options(options_handler),
+        )
+        .route(
+            "/api/notifications/queue/clear",
+            post(clear_notification_queue_handler).options(options_handler),
+        )
+        .route(
+            "/api/notifications/queue/{id}",
+            delete(delete_notification_queue_item_handler).options(options_handler),
+        )
+        .route(
+            "/api/notifications/queue/{id}/retry",
+            post(retry_notification_queue_item_handler).options(options_handler),
         )
         .route(
             "/api/ota/status",

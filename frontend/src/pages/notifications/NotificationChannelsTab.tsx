@@ -103,6 +103,93 @@ export default function NotificationChannelsTab({
     />
   )
 
+  const patchRateLimit = (channel: NotificationChannelInstance, patch: Partial<NotificationChannelInstance['rate_limit']>) => {
+    onPatchChannel(channel.id, {
+      rate_limit: {
+        ...channel.rate_limit,
+        ...patch,
+      },
+    })
+  }
+
+  const renderRateNumberField = (
+    channel: NotificationChannelInstance,
+    key: keyof NotificationChannelInstance['rate_limit'],
+    label: string,
+    min = 0,
+  ) => (
+    <TextField
+      type="number"
+      size="small"
+      label={label}
+      value={channel.rate_limit[key]}
+      onChange={(event: ChangeEvent<HTMLInputElement>) => {
+        const value = Math.max(min, Math.trunc(Number(event.target.value) || min))
+        patchRateLimit(channel, { [key]: value })
+      }}
+      inputProps={{ min }}
+      fullWidth
+    />
+  )
+
+  const renderRateLimitFields = () => {
+    if (!selectedChannel) return null
+    const channel = selectedChannel
+    return (
+      <Box
+        sx={{
+          p: 2,
+          mb: 0,
+          border: '1px solid',
+          borderColor: 'rgba(0, 0, 0, 0.23)',
+          borderRadius: 1,
+          bgcolor: 'transparent',
+        }}
+      >
+        <Box display="flex" alignItems="flex-start" justifyContent="space-between" gap={2} flexWrap="wrap">
+          <Box sx={{ minWidth: 0 }}>
+            <Typography variant="subtitle2" fontWeight={700}>队列保护</Typography>
+            <Typography variant="caption" color="text.secondary">
+              推荐保持开启。超过平台频率时先排队，稍后自动继续推送，避免消息丢失。
+            </Typography>
+          </Box>
+          <FormControlLabel
+            sx={{ mr: 0 }}
+            control={(
+              <Switch
+                checked={channel.rate_limit.enabled}
+                onChange={(event: ChangeEvent<HTMLInputElement>) => {
+                  patchRateLimit(channel, {
+                    enabled: event.target.checked,
+                  })
+                }}
+              />
+            )}
+            label={channel.rate_limit.enabled ? '已开启' : '已关闭'}
+          />
+        </Box>
+
+        {channel.rate_limit.enabled && (
+          <>
+            <Box
+              display="grid"
+              gridTemplateColumns={{ xs: '1fr', sm: 'repeat(2, minmax(0, 1fr))' }}
+              gap={1.5}
+              mt={2}
+            >
+              {renderRateNumberField(channel, 'window_seconds', '统计周期（秒）', 1)}
+              {renderRateNumberField(channel, 'max_messages', '最多发送条数', 1)}
+            </Box>
+
+            <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1 }}>
+              当前限制：每 {channel.rate_limit.window_seconds} 秒最多发送 {channel.rate_limit.max_messages} 条，超出部分将进入通知队列，等待下一个时间窗口自动重试。
+            </Typography>
+          </>
+        )}
+      </Box>
+    )
+  }
+
   const renderChannelFields = () => {
     if (!selectedChannel) {
       return (
@@ -372,6 +459,7 @@ export default function NotificationChannelsTab({
                 />
               )}
               {renderChannelFields()}
+              {selectedChannel && <Box sx={{ mt: 2 }}>{renderRateLimitFields()}</Box>}
             </Box>
           </Box>
         </Box>

@@ -422,7 +422,37 @@ pub struct NotificationChannelInstance {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
+    pub rate_limit: NotificationRateLimitConfig,
+    #[serde(default)]
     pub config: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationRateLimitConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_notification_rate_limit_max_messages")]
+    pub max_messages: u32,
+    #[serde(default = "default_notification_rate_limit_window_seconds")]
+    pub window_seconds: u32,
+}
+
+impl Default for NotificationRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_messages: default_notification_rate_limit_max_messages(),
+            window_seconds: default_notification_rate_limit_window_seconds(),
+        }
+    }
+}
+
+fn default_notification_rate_limit_max_messages() -> u32 {
+    20
+}
+
+fn default_notification_rate_limit_window_seconds() -> u32 {
+    60
 }
 
 fn default_ddns_failure_threshold() -> u32 {
@@ -861,6 +891,7 @@ impl NotificationConfig {
                 channel_type: item.channel_type,
                 name: item.name.clone(),
                 enabled: item.enabled,
+                rate_limit: NotificationRateLimitConfig::default(),
                 config: item.config.clone(),
             })
             .collect::<Vec<_>>();

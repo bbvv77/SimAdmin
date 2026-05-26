@@ -659,6 +659,12 @@ export interface NotificationConfig {
   log_cleanup: NotificationLogCleanupConfig
 }
 
+export interface NotificationRateLimitConfig {
+  enabled: boolean
+  max_messages: number
+  window_seconds: number
+}
+
 export interface NotificationLogCleanupConfig {
   retention_days_enabled: boolean
   retention_days: number
@@ -671,6 +677,7 @@ export interface NotificationChannelInstance {
   type: NotificationChannelKey
   name: string
   enabled: boolean
+  rate_limit: NotificationRateLimitConfig
   config: Record<string, unknown>
 }
 
@@ -725,6 +732,34 @@ export interface NotificationLogEntry {
 
 export interface NotificationLogsResponse {
   logs: NotificationLogEntry[]
+  total: number
+}
+
+export type NotificationQueueItemStatus = 'pending' | 'scheduled' | 'retrying' | 'sending' | 'failed'
+
+export interface NotificationQueueEntry {
+  id: number
+  status: NotificationQueueItemStatus
+  event_type: NotificationEventType
+  event_label: string
+  summary: string
+  reason: string
+  channel_id: string
+  channel_name: string
+  channel_type: NotificationChannelKey
+  rule_id: string
+  rule_name: string
+  title: string
+  body: string
+  next_attempt_at: string
+  attempt_count: number
+  max_attempts: number
+  created_at: string
+  updated_at: string
+}
+
+export interface NotificationQueueResponse {
+  items: NotificationQueueEntry[]
   total: number
 }
 
