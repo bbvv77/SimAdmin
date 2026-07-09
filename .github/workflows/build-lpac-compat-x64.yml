@@ -41,7 +41,7 @@ jobs:
             exit 0
           fi
 
-          OUR_MANIFEST=$(curl -sL -f https://github.com/3899/SimAdmin/releases/download/lpac/lpac-x64.json || echo "{}")
+          OUR_MANIFEST=$(curl -sL -f https://github.com/bbvv77/SimAdmin/releases/download/lpac/lpac-x64.json || echo "{}")
           OUR_TAG=$(echo "$OUR_MANIFEST" | jq -r '.version // empty' || echo "")
           echo "Our current compiled lpac tag: $OUR_TAG"
 
