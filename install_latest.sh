@@ -97,6 +97,28 @@ read_with_proxies() {
   return 1
 }
 
+detect_device_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64)   printf 'x86_64'   ;;
+    aarch64|arm64)  printf 'aarch64'  ;;
+    *)              printf 'unknown'  ;;
+  esac
+}
+
+resolve_asset_name() {
+  if [ -n "$ASSET_NAME" ]; then
+    printf '%s\n' "$ASSET_NAME"
+    return 0
+  fi
+
+  arch="$(detect_device_arch)"
+  case "$arch" in
+    x86_64)   printf 'simadmin-x64.tar.gz'  ;;
+    aarch64)  printf 'simadmin.tar.gz'      ;;
+    *)        printf 'simadmin.tar.gz'      ;;
+  esac
+}
+
 version_to_tag() {
   case "$1" in
     v*) printf '%s\n' "$1" ;;
@@ -106,7 +128,8 @@ version_to_tag() {
 
 asset_url_from_tag() {
   tag="$1"
-  printf 'https://github.com/%s/releases/download/%s/simadmin.tar.gz\n' "$REPO" "$tag"
+  asset_name="$(resolve_asset_name)"
+  printf 'https://github.com/%s/releases/download/%s/%s\n' "$REPO" "$tag" "$asset_name"
 }
 
 repo_version() {
@@ -123,8 +146,9 @@ resolve_asset_url() {
     return 0
   fi
 
+  asset_name="$(resolve_asset_name)"
   if [ "$VERSION" = "latest" ]; then
-    printf 'https://github.com/%s/releases/latest/download/%s\n' "$REPO" "$ASSET_NAME"
+    printf 'https://github.com/%s/releases/latest/download/%s\n' "$REPO" "$asset_name"
   else
     asset_url_from_tag "$(version_to_tag "$VERSION")"
   fi
